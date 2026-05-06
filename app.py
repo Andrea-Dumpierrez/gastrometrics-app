@@ -107,9 +107,23 @@ if st.button("Buscar"):
                 df_mapa = df_mapa.dropna(subset=["latitude", "longitude"])
 
                 if not df_mapa.empty:
-                    # Corregir escala de coordenadas
-                    df_mapa["lat"] = df_mapa["latitude"] / 1000000
-                    df_mapa["lon"] = df_mapa["longitude"] / 1000000
+                    # Lógica inteligente para recuperar coordenadas rotas
+                    def arreglar_latitud(val):
+                        val = float(val)
+                        # Límites latitud en España: ~27 (Islas Canarias) a ~44 (Costa Norte)
+                        while val > 45 or val < 25:
+                            val = val / 10
+                        return val
+
+                    def arreglar_longitud(val):
+                        val = float(val)
+                        # Límites longitud en España: ~-19 (Islas Canarias) a ~5 (Islas Baleares)
+                        while val > 5 or val < -20:
+                            val = val / 10
+                        return val
+
+                    df_mapa["lat"] = df_mapa["latitude"].apply(arreglar_latitud)
+                    df_mapa["lon"] = df_mapa["longitude"].apply(arreglar_longitud)
 
                     df_mapa["rating_mostrado"] = df_mapa["avg_rating"].apply(
                         lambda x: round(x / 10, 1) if pd.notnull(x) else "No disponible"
@@ -128,7 +142,8 @@ if st.button("Buscar"):
                         "ScatterplotLayer",
                         data=df_mapa,
                         get_position=["lon", "lat"],
-                        get_radius=1500,
+                        get_radius=50,
+                        radius_min_pixels=6,
                         get_fill_color=[255, 0, 0, 140],
                         get_line_color=[255, 255, 255],
                         line_width_min_pixels=1,
