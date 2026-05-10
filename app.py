@@ -2,10 +2,9 @@ import streamlit as st
 import pandas as pd
 import pydeck as pdk
 from pymongo import MongoClient
+import math
 
-# -----------------------------
-# CONFIGURACIÓN GENERAL
-# -----------------------------
+# Configuración General
 st.set_page_config(page_title="GastroMetrics", page_icon="🍽️", layout="wide")
 
 # Conexión a MongoDB
@@ -13,170 +12,191 @@ client = MongoClient("mongodb://localhost:27017/")
 db = client["gastrometrics"]
 collection = db["restaurants"]
 
-# -----------------------------
-# INTERFAZ
-# -----------------------------
-st.title("Gastrometría 🍽️")
+# Lógica inteligente para recuperar coordenadas rotas
+def fix_latitude(val):
+    val = float(val)
+    # Límites latitud en España: ~27 (Islas Canarias) a ~44 (Costa Norte)
+    while val > 45 or val < 25:
+        val = val / 10
+    return val
+
+def fix_longitude(val):
+    val = float(val)
+    # Límites longitud en España: ~-19 (Islas Canarias) a ~5 (Islas Baleares)
+    while val > 5 or val < -20:
+        val = val / 10
+    return val
+
+# Funcion para calcular el zoom dinamico basado en la dispersion de los puntos
+def calculate_dynamic_zoom(df):
+    if len(df) <= 1:
+        return 13
+
+    lat_spread = df["lat"].max() - df["lat"].min()
+    lon_spread = df["lon"].max() - df["lon"].min()
+    max_spread = max(lat_spread, lon_spread)
+
+    if max_spread < 0.05:
+        return 12 # Restaurantes muy juntos (mismo barrio o ciudad compacta)
+    elif max_spread < 0.15:
+        return 10 # Ciudad grande
+    elif max_spread < 0.5:
+        return 9  # Area metropolitana
+    else:
+        return 8  # Restaurantes dispersos por toda la region
+
+# Fórmula matemática para el score de popularidad
+def calculate_popularity(rating, reviews):
+    if not rating or not reviews or reviews <= 0:
+        return 0
+    # Usamos log(reseñas + 1) para suavizar el impacto de miles de reseñas
+    return round(rating * math.log1p(reviews), 2)
+
+# Interfaz principal visible para el usuario
+st.title("Gastrometrics 🍽️")
 st.write("Encuentra restaurantes recomendados según ubicación, cocina y valoración.")
 
-tipo_busqueda = st.radio(
-    "¿Cómo quieres buscar?",
-    ["Ciudad", "Provincia"],
-    horizontal=True
-)
+# Barra lateral con filtros
+st.sidebar.header("Filtros de Búsqueda 🔍")
 
-if tipo_busqueda == "Ciudad":
-    opciones = sorted([x for x in collection.distinct("city") if x])
-else:
-    opciones = sorted([x for x in collection.distinct("province") if x])
+# Obtenemos ciudades únicas para el selector
+city_list = sorted([x for x in collection.distinct("city") if x])
+selected_city = st.sidebar.selectbox("🏙️ Selecciona una ciudad:", city_list)
 
-ubicacion = st.selectbox("Selecciona una opción:", opciones)
-tipo_comida = st.text_input("Tipo de comida (opcional):")
-rating_min = st.slider("Calificación mínima", 0.0, 5.0, 3.0, 0.5)
+cuisine_input = st.sidebar.text_input("🍝 Tipo de comida (opcional):")
 
-# -----------------------------
-# BÚSQUEDA
-# -----------------------------
-if st.button("Buscar"):
+# Filtro de nota mínima (Rating original)
+min_rating = st.sidebar.slider("⭐ Calificación mínima", 0.0, 5.0, 3.0, 0.5)
 
-    campo = "city" if tipo_busqueda == "Ciudad" else "province"
-    rating_bd = int(rating_min * 10)
-
-    filtro = {
-        campo: ubicacion,
-        "avg_rating": {"$gte": rating_bd}
+# Botón de búsqueda
+if st.sidebar.button("Buscar Restaurantes 🚀"):
+    rating_threshold = int(min_rating * 10)
+    
+    # Construcción dinámica de la consulta a la base de datos
+    query = {
+        "city": selected_city,
+        "avg_rating": {"$gte": rating_threshold}
     }
-
-    if tipo_comida.strip() != "":
-        filtro["cuisines"] = {"$regex": tipo_comida, "$options": "i"}
-
-    resultados = collection.find(
-        filtro,
-        {
-            "restaurant_name": 1,
-            "address": 1,
-            "city": 1,
-            "province": 1,
-            "cuisines": 1,
-            "avg_rating": 1,
-            "total_reviews_count": 1,
-            "latitude": 1,
-            "longitude": 1,
-            "_id": 0
-        }
-    ).sort([
-        ("avg_rating", -1),
+    
+    # Añadimos filtros opcionales si el usuario los ha rellenado
+    if cuisine_input.strip():
+        query["cuisines"] = {"$regex": cuisine_input, "$options": "i"}
+    
+    # ORDENACIÓN INTELIGENTE EN BASE DE DATOS 
+    # Ordenamos en la BD por nota y reseñas para asegurar que los mejores candidatos entran en el pool de cálculo.
+    cursor = collection.find(query).sort([
+        ("avg_rating", -1), 
         ("total_reviews_count", -1)
-    ]).limit(10)
+    ]).limit(100) # Aumentamos el pool a 100 para más fiabilidad
+    
+    results = list(cursor)
+    
+    if results:
+        # Creación de pestañas para organizar la vista
+        tab_results, tab_stats = st.tabs(["📋 Resultados y Mapa", "📊 Estadísticas de la Ciudad"])
+        
+        with tab_results:
+            # Creamos el DataFrame base con los 100 candidatos
+            df_candidates = pd.DataFrame(results)
+            
+            # Procesamiento de coordenadas y cálculo de métricas para todos los candidatos
+            df_candidates["lat"] = df_candidates["latitude"].apply(fix_latitude)
+            df_candidates["lon"] = df_candidates["longitude"].apply(fix_longitude)
+            df_candidates["display_rating"] = df_candidates["avg_rating"].apply(lambda x: round(x / 10, 1) if pd.notnull(x) else 0)
+            df_candidates["popularity_score"] = df_candidates.apply(
+                lambda row: calculate_popularity(row["display_rating"], row.get("total_reviews_count", 0)), 
+                axis=1
+            )
+            
+            # Ordenar FINALMENTE los candidatos por el Score de Popularidad exacto
+            df_sorted = df_candidates.sort_values(by="popularity_score", ascending=False)
+            
+            # Creamos un DataFrame secundario SÓLO con los 10 mejores del ranking
+            df_top_10 = df_sorted.head(10).copy()
+            
+            col_list, col_map = st.columns([1, 1.2])
+            
+            with col_list:
+                st.subheader(f"Top 10 Restaurantes Populares en {selected_city}")
+                # Iteramos sobre el DataFrame de los 10 mejores
+                for _, row in df_top_10.iterrows():
+                    st.markdown(f"### {row.get('restaurant_name', 'Sin nombre')}")
+                    
+                    # Gestión de datos nulos en la visualización
+                    address = row.get('address', 'No disponible')
+                    cuisines = row.get('cuisines', 'No disponible')
+                    price = row.get('price_range', 'No disponible')
+                    reviews = row.get('total_reviews_count', 0)
 
-    resultados = list(resultados)
+                    # Limpieza visual para evitar que salga "nan" en la interfaz
+                    if pd.isna(address) or str(address).lower() == "nan": 
+                        address = "No disponible"
+                    if pd.isna(cuisines) or str(cuisines).lower() == "nan": 
+                        cuisines = "No disponible"
+                    if pd.isna(price) or str(price).lower() == "nan": 
+                        price = "No disponible"
+                    
+                    st.write(f"📍 Dirección: {address}")
+                    st.write(f"🍝 Cocina: {cuisines}")
+                    st.write(f"💰 Precio: {price}")
+                    st.write(f"⭐ Rating medio: {row['display_rating']}")
+                    st.write(f"📝 Número de reseñas: {reviews}")
+                    st.info(f"🔥 Score de Popularidad: {row['popularity_score']}")
+                    st.divider()
 
-    if resultados:
-        st.success(f"Se encontraron {len(resultados)} restaurantes.")
+            with col_map:
+                st.subheader("🗺️ Mapa del Ranking")
+                
+                # Calculamos el centro del mapa SÓLO con la media de los 10 mejores
+                dynamic_zoom = calculate_dynamic_zoom(df_top_10)
 
-        col1, col2 = st.columns([1.1, 1])
+                view_state = pdk.ViewState(
+                    latitude=float(df_top_10["lat"].mean()),
+                    longitude=float(df_top_10["lon"].mean()),
+                    zoom=dynamic_zoom,
+                    pitch=0
+                )
+                
+                # Dibujamos los 10 puntos del ranking
+                layer = pdk.Layer(
+                    "ScatterplotLayer",
+                    data=df_top_10, # Usamos el DataFrame filtrado de 10
+                    get_position=["lon", "lat"],
+                    get_radius=100, # Radio fijo en metros
+                    radius_min_pixels=6,
+                    get_fill_color=[255, 0, 0, 140],
+                    get_line_color=[255, 255, 255],
+                    line_width_min_pixels=1,
+                    stroked=True,
+                    filled=True,
+                    pickable=True
+                )
+                
+                # Tooltip actualizado
+                tooltip = {
+                    "html": "<b>{restaurant_name}</b><br/>⭐ Rating: {display_rating}<br/>🔥 Score: {popularity_score}",
+                    "style": {"backgroundColor": "white", "color": "black"}
+                }
+                
+                st.pydeck_chart(pdk.Deck(
+                    layers=[layer], 
+                    initial_view_state=view_state,
+                    tooltip=tooltip
+                ))
 
-        with col1:
-            for r in resultados:
-                nombre = r.get("restaurant_name", "Sin nombre")
-                direccion = r.get("address", "No disponible")
-                ciudad = r.get("city", "No disponible")
-                provincia = r.get("province", "No disponible")
-                cocina = r.get("cuisines", "No disponible")
-                reviews = r.get("total_reviews_count", "No disponible")
-
-                avg_rating = r.get("avg_rating")
-                rating = round(avg_rating / 10, 1) if avg_rating is not None else "No disponible"
-
-                st.subheader(nombre)
-                st.write(f"📍 Dirección: {direccion}")
-                st.write(f"🏙️ Ciudad: {ciudad}")
-                st.write(f"🗺️ Provincia: {provincia}")
-                st.write(f"🍝 Cocina: {cocina}")
-                st.write(f"⭐ Rating medio: {rating}")
-                st.write(f"📝 Número de reseñas: {reviews}")
-                st.markdown("---")
-
-        with col2:
-            df_mapa = pd.DataFrame(resultados)
-
-            if not df_mapa.empty:
-                df_mapa["latitude"] = pd.to_numeric(df_mapa["latitude"], errors="coerce")
-                df_mapa["longitude"] = pd.to_numeric(df_mapa["longitude"], errors="coerce")
-
-                df_mapa = df_mapa.dropna(subset=["latitude", "longitude"])
-
-                if not df_mapa.empty:
-                    # Lógica inteligente para recuperar coordenadas rotas
-                    def arreglar_latitud(val):
-                        val = float(val)
-                        # Límites latitud en España: ~27 (Islas Canarias) a ~44 (Costa Norte)
-                        while val > 45 or val < 25:
-                            val = val / 10
-                        return val
-
-                    def arreglar_longitud(val):
-                        val = float(val)
-                        # Límites longitud en España: ~-19 (Islas Canarias) a ~5 (Islas Baleares)
-                        while val > 5 or val < -20:
-                            val = val / 10
-                        return val
-
-                    df_mapa["lat"] = df_mapa["latitude"].apply(arreglar_latitud)
-                    df_mapa["lon"] = df_mapa["longitude"].apply(arreglar_longitud)
-
-                    df_mapa["rating_mostrado"] = df_mapa["avg_rating"].apply(
-                        lambda x: round(x / 10, 1) if pd.notnull(x) else "No disponible"
-                    )
-
-                    st.subheader("Mapa de restaurantes")
-
-                    view_state = pdk.ViewState(
-                        latitude=float(df_mapa["lat"].mean()),
-                        longitude=float(df_mapa["lon"].mean()),
-                        zoom=8,
-                        pitch=0
-                    )
-
-                    layer = pdk.Layer(
-                        "ScatterplotLayer",
-                        data=df_mapa,
-                        get_position=["lon", "lat"],
-                        get_radius=50,
-                        radius_min_pixels=6,
-                        get_fill_color=[255, 0, 0, 140],
-                        get_line_color=[255, 255, 255],
-                        line_width_min_pixels=1,
-                        stroked=True,
-                        filled=True,
-                        pickable=True
-                    )
-
-                    tooltip = {
-                        "html": """
-                        <b>{restaurant_name}</b><br/>
-                        📍 {address}<br/>
-                        ⭐ {rating_mostrado}<br/>
-                        📝 {total_reviews_count} reseñas
-                        """,
-                        "style": {
-                            "backgroundColor": "white",
-                            "color": "black"
-                        }
-                    }
-
-                    deck = pdk.Deck(
-                        initial_view_state=view_state,
-                        layers=[layer],
-                        tooltip=tooltip
-                    )
-
-                    st.pydeck_chart(deck, use_container_width=True)
-
+        with tab_stats:
+            st.subheader(f"Distribución de Cocinas (Basado en Top 100 de {selected_city})")
+            # Usamos el DataFrame de candidatos (100) para estadísticas más ricas
+            if "cuisines" in df_candidates.columns:
+                # Limpieza y conteo de cocinas
+                all_cuisines = df_candidates["cuisines"].dropna().astype(str).str.split(", ").explode()
+                top_cuisines = all_cuisines.value_counts().head(10)
+                if not top_cuisines.empty:
+                    st.bar_chart(top_cuisines)
                 else:
-                    st.warning("No hay coordenadas válidas para mostrar el mapa.")
+                    st.warning("No hay datos de cocina suficientes para generar el gráfico.")
             else:
-                st.warning("No hay resultados para generar el mapa.")
+                st.warning("No hay datos de cocina suficientes para generar el gráfico.")
 
     else:
-        st.error("No se encontraron restaurantes con esos filtros.")
+        st.error("No se encontraron restaurantes con esos filtros. Prueba a bajar la nota o quitar el filtro de precio.")
