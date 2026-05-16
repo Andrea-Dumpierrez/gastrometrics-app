@@ -3,6 +3,7 @@ import pandas as pd
 import pydeck as pdk
 from pymongo import MongoClient
 import math
+import altair as alt
 
 # Configuración General
 st.set_page_config(page_title="GastroMetrics", page_icon="🍽️", layout="wide")
@@ -53,7 +54,7 @@ def calculate_popularity(rating, reviews):
     return round(rating * math.log1p(reviews), 2)
 
 # Interfaz principal visible para el usuario
-st.title("Gastrometrics 🍽️")
+st.title("Gastrometría 🍽️")
 st.write("Encuentra restaurantes recomendados según ubicación, cocina y valoración.")
 
 # Barra lateral con filtros
@@ -63,7 +64,18 @@ st.sidebar.header("Filtros de Búsqueda 🔍")
 city_list = sorted([x for x in collection.distinct("city") if x])
 selected_city = st.sidebar.selectbox("🏙️ Selecciona una ciudad:", city_list)
 
-cuisine_input = st.sidebar.text_input("🍝 Tipo de comida (opcional):")
+# Obtenemos tipos de comida únicos, separando los que vienen en listas (ej. "Italian, Pizza")
+raw_cuisines = collection.distinct("cuisines")
+cuisines_set = set()
+for c in raw_cuisines:
+    if pd.notnull(c) and str(c).lower() != "nan":
+        for item in str(c).split(","):
+            clean_item = item.strip()
+            if clean_item:
+                cuisines_set.add(clean_item)
+
+cuisine_list = ["Cualquiera"] + sorted(list(cuisines_set))
+selected_cuisine = st.sidebar.selectbox("🍝 Tipo de comida (opcional):", cuisine_list)
 
 # Filtro de nota mínima (Rating original)
 min_rating = st.sidebar.slider("⭐ Calificación mínima", 0.0, 5.0, 3.0, 0.5)
@@ -79,8 +91,8 @@ if st.sidebar.button("Buscar Restaurantes 🚀"):
     }
     
     # Añadimos filtros opcionales si el usuario los ha rellenado
-    if cuisine_input.strip():
-        query["cuisines"] = {"$regex": cuisine_input, "$options": "i"}
+    if selected_cuisine != "Cualquiera":
+        query["cuisines"] = {"$regex": selected_cuisine, "$options": "i"}
     
     # ORDENACIÓN INTELIGENTE EN BASE DE DATOS 
     # Ordenamos en la BD por nota y reseñas para asegurar que los mejores candidatos entran en el pool de cálculo.
@@ -191,8 +203,19 @@ if st.sidebar.button("Buscar Restaurantes 🚀"):
                 # Limpieza y conteo de cocinas
                 all_cuisines = df_candidates["cuisines"].dropna().astype(str).str.split(", ").explode()
                 top_cuisines = all_cuisines.value_counts().head(10)
+                
                 if not top_cuisines.empty:
-                    st.bar_chart(top_cuisines)
+                    # Convertimos la Serie de datos a un DataFrame compatible con Altair
+                    df_chart = top_cuisines.reset_index()
+                    df_chart.columns = ["Cuisine", "Count"]
+
+                    chart = alt.Chart(df_chart).mark_bar().encode(
+                        x=alt.X("Cuisine", sort=None, title="", axis=alt.Axis(labelAngle=-45)),
+                        y=alt.Y("Count", title="")
+                    )
+                    
+                    # Dibujamos el grafico
+                    st.altair_chart(chart, use_container_width=True)
                 else:
                     st.warning("No hay datos de cocina suficientes para generar el gráfico.")
             else:
