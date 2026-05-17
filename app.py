@@ -54,7 +54,7 @@ def calculate_popularity(rating, reviews):
     return round(rating * math.log1p(reviews), 2)
 
 # Interfaz principal visible para el usuario
-st.title("Gastrometría 🍽️")
+st.title("GastroMetrics 🍽️")
 st.write("Encuentra restaurantes recomendados según ubicación, cocina y valoración.")
 
 # Barra lateral con filtros
